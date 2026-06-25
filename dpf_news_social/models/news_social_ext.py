@@ -107,6 +107,50 @@ def _oauth1_header(method, url, params, api_key, api_secret, token, token_secret
     )
 
 
+def _crop_to_instagram_ratio(image_b64):
+    """
+    Crop and resize image to a valid Instagram aspect ratio.
+    Valid range: 0.8 (4:5 portrait) to 1.91 (landscape).
+    Defaults to 1:1 square if outside range.
+    Returns base64-encoded JPEG bytes.
+    """
+    try:
+        from PIL import Image
+        import io
+
+        img_data = base64.b64decode(image_b64)
+        img = Image.open(io.BytesIO(img_data)).convert('RGB')
+        w, h = img.size
+        ratio = w / h
+
+        MIN_RATIO = 0.8    # 4:5 portrait
+        MAX_RATIO = 1.91   # 1.91:1 landscape
+
+        if ratio < MIN_RATIO:
+            # Too tall — crop height to match 4:5
+            new_h = int(w / MIN_RATIO)
+            top = (h - new_h) // 2
+            img = img.crop((0, top, w, top + new_h))
+        elif ratio > MAX_RATIO:
+            # Too wide — crop width to match 1.91:1
+            new_w = int(h * MAX_RATIO)
+            left = (w - new_w) // 2
+            img = img.crop((left, 0, left + new_w, h))
+
+        # Resize to max 1080px width keeping ratio
+        max_size = 1080
+        iw, ih = img.size
+        if iw > max_size:
+            img = img.resize((max_size, int(max_size * ih / iw)), Image.LANCZOS)
+
+        buffer = io.BytesIO()
+        img.save(buffer, format='JPEG', quality=95)
+        return base64.b64encode(buffer.getvalue()).decode()
+    except Exception as e:
+        _logger.warning('DPF Instagram image crop failed: %s', e)
+        return image_b64  # return original if PIL not available
+
+
 class NewsPost(models.Model):
     _inherit = 'news.post'
 
@@ -219,6 +263,7 @@ class NewsPost(models.Model):
         ) % (_e(self.name), self.date.strftime('%d.%m.%Y'), _e(preview))
 
         return text, url
+
     def _log_social(self, channel, status, message=''):
         self.env['news.social.log'].sudo().create({
             'post_id': self.id,
@@ -373,12 +418,19 @@ class NewsPost(models.Model):
             return
         try:
             def _img_url(img_rec):
-                return '%s/web/image/news.post.image/%d/image' % (base_url, img_rec.id)
+                # Crop image to valid Instagram aspect ratio before publishing
+                cropped_b64 = _crop_to_instagram_ratio(img_rec.image)
+                # Upload cropped image to imgbb and return public URL
+                return _upload_image_to_imgbb(cropped_b64)
 
             if len(img_list) == 1:
+                img_url = _img_url(img_list[0])
+                if not img_url:
+                    self._log_social('instagram', 'error', 'Image upload failed')
+                    return
                 _, r = _json_post(
                     '%s/%s/media' % (api_base, ig_id),
-                    {'image_url': _img_url(img_list[0]), 'caption': caption, 'access_token': page_token},
+                    {'image_url': img_url, 'caption': caption, 'access_token': page_token},
                 )
                 container_id = r.get('id')
                 if not container_id:
@@ -387,9 +439,12 @@ class NewsPost(models.Model):
             else:
                 item_ids = []
                 for img_rec in img_list:
+                    img_url = _img_url(img_rec)
+                    if not img_url:
+                        continue
                     _, r = _json_post(
                         '%s/%s/media' % (api_base, ig_id),
-                        {'image_url': _img_url(img_rec), 'is_carousel_item': 'true', 'access_token': page_token},
+                        {'image_url': img_url, 'is_carousel_item': 'true', 'access_token': page_token},
                     )
                     if 'id' in r:
                         item_ids.append(r['id'])
@@ -462,3 +517,31 @@ class NewsPost(models.Model):
         except Exception as e:
             _logger.error('DPF Twitter error: %s', e)
             self._log_social('twitter', 'error', str(e))
+
+
+def _upload_image_to_imgbb(image_b64):
+    """
+    Upload base64 image to imgbb.com and return public URL.
+    Requires IMGBB_API_KEY environment variable or Odoo system parameter.
+    Falls back to None if upload fails.
+    """
+    import os
+    api_key = os.environ.get('IMGBB_API_KEY', '')
+    if not api_key:
+        _logger.warning('DPF Instagram: IMGBB_API_KEY not set, cannot upload image')
+        return None
+    try:
+        data = urllib.parse.urlencode({
+            'key': api_key,
+            'image': image_b64,
+        }).encode('utf-8')
+        req = urllib.request.Request('https://api.imgbb.com/1/upload', data=data, method='POST')
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read())
+            if result.get('success'):
+                return result['data']['url']
+            _logger.warning('DPF imgbb upload failed: %s', result)
+            return None
+    except Exception as e:
+        _logger.error('DPF imgbb upload error: %s', e)
+        return None
